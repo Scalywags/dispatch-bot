@@ -32,7 +32,6 @@ async function getGoogleAccessToken() {
   const claimB64 = encode(claim);
   const signingInput = `${headerB64}.${claimB64}`;
 
-  // Import the private key
   const privateKeyPem = GOOGLE_SERVICE_ACCOUNT.private_key;
   const pemContents = privateKeyPem
     .replace("-----BEGIN PRIVATE KEY-----", "")
@@ -88,7 +87,6 @@ async function findInbooxIndex(doc) {
     if (element.paragraph) {
       for (const el of element.paragraph.elements) {
         if (el.textRun && el.textRun.content.includes("Inboox")) {
-          // Return the end index of this line so we insert right after it
           return element.endIndex - 1;
         }
       }
@@ -194,6 +192,21 @@ async function transcribeAudio(audioBuffer) {
   return data.text;
 }
 
+// --- Slack ---
+async function sendSlackMessage(channelId, text, botToken) {
+  console.log("Sending Slack message:", text);
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${botToken}`,
+    },
+    body: JSON.stringify({ channel: channelId, text }),
+  });
+  const data = await res.json();
+  console.log("Slack sendMessage response:", JSON.stringify(data));
+}
+
 // --- Main Handler ---
 module.exports = async function handler(req, res) {
   console.log("Webhook hit - method:", req.method);
@@ -205,6 +218,12 @@ module.exports = async function handler(req, res) {
   try {
     const body = req.body;
     console.log("Incoming body:", JSON.stringify(body));
+
+    // Slack challenge verification
+    if (body?.type === "url_verification") {
+      console.log("Slack challenge received, responding");
+      return res.status(200).json({ challenge: body.challenge });
+    }
 
     const message = body?.message;
     if (!message) {
@@ -233,7 +252,6 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Get access token and doc
     const accessToken = await getGoogleAccessToken();
     const doc = await getDocContent(accessToken);
     const inbooxIndex = await findInbooxIndex(doc);
@@ -243,14 +261,10 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Extract clean task from GPT
     const task = await processWithGPT(userText);
     console.log("Extracted task:", task);
 
-    // Insert into doc
     await insertTextAfterInboox(accessToken, inbooxIndex, task);
-
-    // Confirm back to user
     await sendTelegramMessage(`✅ Added to Inboox: "${task}"`);
 
     return res.status(200).json({ ok: true });
