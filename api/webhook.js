@@ -97,6 +97,7 @@ async function findInbooxIndex(doc) {
 }
 
 async function insertTextAfterInboox(accessToken, index, text) {
+  const newText = `\n${text}`;
   const res = await fetch(
     `https://docs.googleapis.com/v1/documents/${GOOGLE_DOC_ID}:batchUpdate`,
     {
@@ -106,7 +107,26 @@ async function insertTextAfterInboox(accessToken, index, text) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        requests: [{ insertText: { location: { index }, text: `\n${text}` } }],
+        requests: [
+          {
+            insertText: {
+              location: { index },
+              text: newText,
+            },
+          },
+          {
+            updateTextStyle: {
+              range: {
+                startIndex: index + 1,
+                endIndex: index + newText.length,
+              },
+              textStyle: {
+                bold: false,
+              },
+              fields: "bold",
+            },
+          },
+        ],
       }),
     }
   );
