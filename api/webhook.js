@@ -3,16 +3,14 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_DOC_ID = process.env.GOOGLE_DOC_ID;
 const GOOGLE_SERVICE_ACCOUNT = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const SLACK_USER_ID = process.env.SLACK_USER_ID;
+const SIRI_AUTH_TOKEN = process.env.SIRI_AUTH_TOKEN;
 
 console.log("ENV CHECK - TELEGRAM_TOKEN:", TELEGRAM_TOKEN ? "set" : "MISSING");
 console.log("ENV CHECK - TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID);
 console.log("ENV CHECK - OPENAI_API_KEY:", OPENAI_API_KEY ? "set" : "MISSING");
 console.log("ENV CHECK - GOOGLE_DOC_ID:", GOOGLE_DOC_ID ? "set" : "MISSING");
 console.log("ENV CHECK - GOOGLE_SERVICE_ACCOUNT:", GOOGLE_SERVICE_ACCOUNT ? "set" : "MISSING");
-console.log("ENV CHECK - SLACK_BOT_TOKEN:", SLACK_BOT_TOKEN ? "set" : "MISSING");
-console.log("ENV CHECK - SLACK_USER_ID:", SLACK_USER_ID);
+console.log("ENV CHECK - SIRI_AUTH_TOKEN:", SIRI_AUTH_TOKEN ? "set" : "MISSING");
 
 // --- Google Auth ---
 async function getGoogleAccessToken() {
@@ -183,21 +181,6 @@ async function transcribeAudio(audioBuffer) {
   return data.text;
 }
 
-// --- Slack ---
-async function sendSlackMessage(channel, text) {
-  console.log("Sending Slack message:", text);
-  const res = await fetch("https://slack.com/api/chat.postMessage", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-    },
-    body: JSON.stringify({ channel, text }),
-  });
-  const data = await res.json();
-  console.log("Slack sendMessage response:", JSON.stringify(data));
-}
-
 // --- Core Task Handler ---
 async function handleTask(userText, replyFn) {
   const accessToken = await getGoogleAccessToken();
@@ -227,30 +210,26 @@ module.exports = async function handler(req, res) {
     const body = req.body;
     console.log("Incoming body:", JSON.stringify(body));
 
-    // Slack challenge verification
-    if (body?.type === "url_verification") {
-      console.log("Slack challenge received");
-      return res.status(200).json({ challenge: body.challenge });
-    }
+    // --- Siri direct call ---
+    if (body?.source === "siri") {
+      console.log("Siri request received");
 
-    // --- Slack event ---
-    if (body?.event) {
-      const event = body.event;
-      console.log("Slack event:", JSON.stringify(event));
+      // Auth check
+      const authHeader = req.headers["authorization"];
+      if (!authHeader || authHeader !== `Bearer ${SIRI_AUTH_TOKEN}`) {
+        console.log("Siri auth failed");
+        return res.status(401).json({ ok: false, error: "Unauthorized" });
+      }
 
-      // Ignore messages from bots including our own
-      if (event.bot_id || event.user === SLACK_USER_ID === false) {
+      const userText = body.text;
+      if (!userText) {
         return res.status(200).json({ ok: true });
       }
 
-      // Only handle DMs from the authorized user
-      if (event.type === "message" && event.user === SLACK_USER_ID) {
-        const userText = event.text;
-        const channel = event.channel;
-        await handleTask(userText, (text) => sendSlackMessage(channel, text));
-      }
-
-      return res.status(200).json({ ok: true });
+      // Respond immediately so Siri doesn't time out
+      res.status(200).json({ ok: true });
+      await handleTask(userText, sendTelegramMessage);
+      return;
     }
 
     // --- Telegram event ---
@@ -287,6 +266,7 @@ module.exports = async function handler(req, res) {
   } catch (err) {
     console.error("Webhook error:", err.message);
     console.error("Stack:", err.stack);
+    await sendTelegramMessage("❌ Something went wrong, check the logs.");
     return res.status(200).json({ ok: true });
   }
-};
+}
