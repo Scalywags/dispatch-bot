@@ -1,11 +1,158 @@
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GOOGLE_DOC_ID = process.env.GOOGLE_DOC_ID;
+const GOOGLE_SERVICE_ACCOUNT = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
 
 console.log("ENV CHECK - TELEGRAM_TOKEN:", TELEGRAM_TOKEN ? "set" : "MISSING");
 console.log("ENV CHECK - TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID);
 console.log("ENV CHECK - OPENAI_API_KEY:", OPENAI_API_KEY ? "set" : "MISSING");
+console.log("ENV CHECK - GOOGLE_DOC_ID:", GOOGLE_DOC_ID ? "set" : "MISSING");
+console.log("ENV CHECK - GOOGLE_SERVICE_ACCOUNT:", GOOGLE_SERVICE_ACCOUNT ? "set" : "MISSING");
 
+// --- Google Auth ---
+async function getGoogleAccessToken() {
+  const header = { alg: "RS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: GOOGLE_SERVICE_ACCOUNT.client_email,
+    scope: "https://www.googleapis.com/auth/documents",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const encode = (obj) =>
+    btoa(JSON.stringify(obj))
+      .replace(/=/g, "")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_");
+
+  const headerB64 = encode(header);
+  const claimB64 = encode(claim);
+  const signingInput = `${headerB64}.${claimB64}`;
+
+  // Import the private key
+  const privateKeyPem = GOOGLE_SERVICE_ACCOUNT.private_key;
+  const pemContents = privateKeyPem
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\n/g, "");
+  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryDer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    new TextEncoder().encode(signingInput)
+  );
+
+  const signatureB64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+
+  const jwt = `${signingInput}.${signatureB64}`;
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+  });
+
+  const tokenData = await tokenRes.json();
+  console.log("Google token response:", JSON.stringify(tokenData));
+  return tokenData.access_token;
+}
+
+// --- Google Docs ---
+async function getDocContent(accessToken) {
+  const res = await fetch(
+    `https://docs.googleapis.com/v1/documents/${GOOGLE_DOC_ID}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const data = await res.json();
+  return data;
+}
+
+async function findInbooxIndex(doc) {
+  const content = doc.body.content;
+  for (const element of content) {
+    if (element.paragraph) {
+      for (const el of element.paragraph.elements) {
+        if (el.textRun && el.textRun.content.includes("Inboox")) {
+          // Return the end index of this line so we insert right after it
+          return element.endIndex - 1;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function insertTextAfterInboox(accessToken, index, text) {
+  const res = await fetch(
+    `https://docs.googleapis.com/v1/documents/${GOOGLE_DOC_ID}:batchUpdate`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        requests: [
+          {
+            insertText: {
+              location: { index },
+              text: `\n${text}`,
+            },
+          },
+        ],
+      }),
+    }
+  );
+  const data = await res.json();
+  console.log("Docs insert response:", JSON.stringify(data));
+  return data;
+}
+
+// --- GPT ---
+async function processWithGPT(userMessage) {
+  console.log("Sending to GPT:", userMessage);
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "system",
+          content: `You are a to-do list assistant. The user will tell you something they want added to their to-do list. Extract just the task itself, clean and concise, no extra words. Return only the task text, nothing else. No bullet points, no dashes, no numbering.`,
+        },
+        {
+          role: "user",
+          content: userMessage,
+        },
+      ],
+    }),
+  });
+  const data = await res.json();
+  console.log("GPT response:", JSON.stringify(data));
+  return data.choices[0].message.content.trim();
+}
+
+// --- Telegram ---
 async function sendTelegramMessage(text) {
   console.log("Sending Telegram message:", text);
   const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
@@ -47,39 +194,11 @@ async function transcribeAudio(audioBuffer) {
   return data.text;
 }
 
-async function processWithGPT(userMessage) {
-  console.log("Sending to GPT:", userMessage);
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "system",
-          content: `You are a to-do list assistant. The user will tell you something they want added to their to-do list or an action to take. Confirm what you understood and what action you will take. Keep it short and friendly, one or two sentences max.`,
-        },
-        {
-          role: "user",
-          content: userMessage,
-        },
-      ],
-    }),
-  });
-  const data = await res.json();
-  console.log("GPT response:", JSON.stringify(data));
-  return data.choices[0].message.content;
-}
-
+// --- Main Handler ---
 module.exports = async function handler(req, res) {
   console.log("Webhook hit - method:", req.method);
 
   if (req.method !== "POST") {
-    console.log("Not a POST, returning early");
     return res.status(200).json({ ok: true });
   }
 
@@ -88,18 +207,10 @@ module.exports = async function handler(req, res) {
     console.log("Incoming body:", JSON.stringify(body));
 
     const message = body?.message;
-    console.log("Message:", JSON.stringify(message));
-
     if (!message) {
-      console.log("No message found, returning early");
       return res.status(200).json({ ok: true });
     }
 
-    console.log("Incoming chat.id:", String(message.chat.id));
-    console.log("Expected TELEGRAM_CHAT_ID:", String(TELEGRAM_CHAT_ID));
-    console.log("Match:", String(message.chat.id) === String(TELEGRAM_CHAT_ID));
-
-    // Security check: only respond to your own chat
     if (String(message.chat.id) !== String(TELEGRAM_CHAT_ID)) {
       console.log("Chat ID mismatch, rejecting");
       return res.status(200).json({ ok: true });
@@ -119,20 +230,34 @@ module.exports = async function handler(req, res) {
     }
 
     if (!userText) {
-      console.log("No user text extracted, returning early");
       return res.status(200).json({ ok: true });
     }
 
-    console.log("Processing with GPT:", userText);
-    const reply = await processWithGPT(userText);
-    console.log("Got reply:", reply);
-    await sendTelegramMessage(reply);
+    // Get access token and doc
+    const accessToken = await getGoogleAccessToken();
+    const doc = await getDocContent(accessToken);
+    const inbooxIndex = await findInbooxIndex(doc);
 
-    console.log("Done, returning 200");
+    if (inbooxIndex === null) {
+      await sendTelegramMessage("❌ Couldn't find the Inboox section in your doc. Make sure it exists!");
+      return res.status(200).json({ ok: true });
+    }
+
+    // Extract clean task from GPT
+    const task = await processWithGPT(userText);
+    console.log("Extracted task:", task);
+
+    // Insert into doc
+    await insertTextAfterInboox(accessToken, inbooxIndex, task);
+
+    // Confirm back to user
+    await sendTelegramMessage(`✅ Added to Inboox: "${task}"`);
+
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Webhook error:", err.message);
     console.error("Stack:", err.stack);
+    await sendTelegramMessage("❌ Something went wrong, check the logs.");
     return res.status(200).json({ ok: true });
   }
 };
