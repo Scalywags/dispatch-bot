@@ -3,12 +3,16 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GOOGLE_DOC_ID = process.env.GOOGLE_DOC_ID;
 const GOOGLE_SERVICE_ACCOUNT = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SLACK_USER_ID = process.env.SLACK_USER_ID;
 
 console.log("ENV CHECK - TELEGRAM_TOKEN:", TELEGRAM_TOKEN ? "set" : "MISSING");
 console.log("ENV CHECK - TELEGRAM_CHAT_ID:", TELEGRAM_CHAT_ID);
 console.log("ENV CHECK - OPENAI_API_KEY:", OPENAI_API_KEY ? "set" : "MISSING");
 console.log("ENV CHECK - GOOGLE_DOC_ID:", GOOGLE_DOC_ID ? "set" : "MISSING");
 console.log("ENV CHECK - GOOGLE_SERVICE_ACCOUNT:", GOOGLE_SERVICE_ACCOUNT ? "set" : "MISSING");
+console.log("ENV CHECK - SLACK_BOT_TOKEN:", SLACK_BOT_TOKEN ? "set" : "MISSING");
+console.log("ENV CHECK - SLACK_USER_ID:", SLACK_USER_ID);
 
 // --- Google Auth ---
 async function getGoogleAccessToken() {
@@ -77,8 +81,7 @@ async function getDocContent(accessToken) {
     `https://docs.googleapis.com/v1/documents/${GOOGLE_DOC_ID}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
-  const data = await res.json();
-  return data;
+  return await res.json();
 }
 
 async function findInbooxIndex(doc) {
@@ -105,14 +108,7 @@ async function insertTextAfterInboox(accessToken, index, text) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        requests: [
-          {
-            insertText: {
-              location: { index },
-              text: `\n${text}`,
-            },
-          },
-        ],
+        requests: [{ insertText: { location: { index }, text: `\n${text}` } }],
       }),
     }
   );
@@ -138,10 +134,7 @@ async function processWithGPT(userMessage) {
           role: "system",
           content: `You are a to-do list assistant. The user will tell you something they want added to their to-do list. Extract just the task itself, clean and concise, no extra words. Return only the task text, nothing else. No bullet points, no dashes, no numbering.`,
         },
-        {
-          role: "user",
-          content: userMessage,
-        },
+        { role: "user", content: userMessage },
       ],
     }),
   });
@@ -168,7 +161,6 @@ async function downloadVoiceFile(fileId) {
   const fileInfoUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`;
   const fileInfoRes = await fetch(fileInfoUrl);
   const fileInfo = await fileInfoRes.json();
-  console.log("File info:", JSON.stringify(fileInfo));
   const filePath = fileInfo.result.file_path;
   const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
   const audioRes = await fetch(fileUrl);
@@ -181,7 +173,6 @@ async function transcribeAudio(audioBuffer) {
   const blob = new Blob([audioBuffer], { type: "audio/ogg" });
   formData.append("file", blob, "voice.ogg");
   formData.append("model", "whisper-1");
-
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
@@ -193,18 +184,35 @@ async function transcribeAudio(audioBuffer) {
 }
 
 // --- Slack ---
-async function sendSlackMessage(channelId, text, botToken) {
+async function sendSlackMessage(channel, text) {
   console.log("Sending Slack message:", text);
   const res = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${botToken}`,
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
     },
-    body: JSON.stringify({ channel: channelId, text }),
+    body: JSON.stringify({ channel, text }),
   });
   const data = await res.json();
   console.log("Slack sendMessage response:", JSON.stringify(data));
+}
+
+// --- Core Task Handler ---
+async function handleTask(userText, replyFn) {
+  const accessToken = await getGoogleAccessToken();
+  const doc = await getDocContent(accessToken);
+  const inbooxIndex = await findInbooxIndex(doc);
+
+  if (inbooxIndex === null) {
+    await replyFn("❌ Couldn't find the Inboox section in your doc. Make sure it exists!");
+    return;
+  }
+
+  const task = await processWithGPT(userText);
+  console.log("Extracted task:", task);
+  await insertTextAfterInboox(accessToken, inbooxIndex, task);
+  await replyFn(`✅ Added to Inboox: "${task}"`);
 }
 
 // --- Main Handler ---
@@ -221,10 +229,31 @@ module.exports = async function handler(req, res) {
 
     // Slack challenge verification
     if (body?.type === "url_verification") {
-      console.log("Slack challenge received, responding");
+      console.log("Slack challenge received");
       return res.status(200).json({ challenge: body.challenge });
     }
 
+    // --- Slack event ---
+    if (body?.event) {
+      const event = body.event;
+      console.log("Slack event:", JSON.stringify(event));
+
+      // Ignore messages from bots including our own
+      if (event.bot_id || event.user === SLACK_USER_ID === false) {
+        return res.status(200).json({ ok: true });
+      }
+
+      // Only handle DMs from the authorized user
+      if (event.type === "message" && event.user === SLACK_USER_ID) {
+        const userText = event.text;
+        const channel = event.channel;
+        await handleTask(userText, (text) => sendSlackMessage(channel, text));
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Telegram event ---
     const message = body?.message;
     if (!message) {
       return res.status(200).json({ ok: true });
@@ -252,26 +281,12 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    const accessToken = await getGoogleAccessToken();
-    const doc = await getDocContent(accessToken);
-    const inbooxIndex = await findInbooxIndex(doc);
-
-    if (inbooxIndex === null) {
-      await sendTelegramMessage("❌ Couldn't find the Inboox section in your doc. Make sure it exists!");
-      return res.status(200).json({ ok: true });
-    }
-
-    const task = await processWithGPT(userText);
-    console.log("Extracted task:", task);
-
-    await insertTextAfterInboox(accessToken, inbooxIndex, task);
-    await sendTelegramMessage(`✅ Added to Inboox: "${task}"`);
-
+    await handleTask(userText, sendTelegramMessage);
     return res.status(200).json({ ok: true });
+
   } catch (err) {
     console.error("Webhook error:", err.message);
     console.error("Stack:", err.stack);
-    await sendTelegramMessage("❌ Something went wrong, check the logs.");
     return res.status(200).json({ ok: true });
   }
 };
