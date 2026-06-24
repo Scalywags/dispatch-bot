@@ -183,6 +183,7 @@ async function transcribeAudio(audioBuffer) {
 
 // --- Core Task Handler ---
 async function handleTask(userText, replyFn) {
+  console.log("Handling task:", userText);
   const accessToken = await getGoogleAccessToken();
   const doc = await getDocContent(accessToken);
   const inbooxIndex = await findInbooxIndex(doc);
@@ -214,22 +215,22 @@ module.exports = async function handler(req, res) {
     if (body?.source === "siri") {
       console.log("Siri request received");
 
-      // Auth check
       const authHeader = req.headers["authorization"];
       if (!authHeader || authHeader !== `Bearer ${SIRI_AUTH_TOKEN}`) {
         console.log("Siri auth failed");
         return res.status(401).json({ ok: false, error: "Unauthorized" });
       }
 
-      const userText = body.text;
+      // Take only the first line in case Siri duplicates the text
+      const userText = body.text?.split("\n")[0].trim();
+      console.log("Siri text:", userText);
+
       if (!userText) {
         return res.status(200).json({ ok: true });
       }
 
-      // Respond immediately so Siri doesn't time out
-      res.status(200).json({ ok: true });
       await handleTask(userText, sendTelegramMessage);
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     // --- Telegram event ---
@@ -269,4 +270,4 @@ module.exports = async function handler(req, res) {
     await sendTelegramMessage("❌ Something went wrong, check the logs.");
     return res.status(200).json({ ok: true });
   }
-}
+};
